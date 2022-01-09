@@ -1,19 +1,21 @@
 [tool.poetry]
-name = "tg"
+name = "yc-bot-tg"
 version = "0.1.0"
 description = ""
-authors = ["Your Name <you@example.com>"]
+authors = []
 
 [tool.poetry.dependencies]
-python = "^3.8"
-pytelegrambotapi = "^3.7.3"
-yandexcloud = "^0.64.0"
+python = "^3.7"
+pytelegrambotapi = "^4.3.0"
+yandexcloud = "^0.125.0"
+typing-extensions = "^4.0.1"
+emoji = "^1.6.1"
 
 [tool.poetry.dev-dependencies]
-flake8 = "^3.8.4"
+flake8 = "^4.0.1"
 flake8-isort = "^4.0.0"
-flake8-bugbear = "^20.1.4"
-flake8-variables-names = "^0.0.3"
+flake8-bugbear = "^21.11.29"
+flake8-variables-names = "^0.0.4"
 flake8-builtins = "^1.5.3"
 
 [tool.isort]
@@ -23,5 +25,5 @@ include_trailing_comma = true
 force_grid_wrap = 3
 
 [build-system]
-requires = ["poetry>=0.12"]
+requires = ["poetry>=1.0.0"]
 build-backend = "poetry.masonry.api"
