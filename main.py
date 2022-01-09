@@ -1,121 +1,183 @@
-import json
-import os
-from typing import Optional, Tuple
+#!/usr/bin/env python
 
-import grpc
+import logging
+import os
+import re
+from functools import partial
+from typing import (
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    cast,
+)
+
 import telebot
 import yandexcloud
+from emoji import emojize
 from telebot.types import (
+    BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
     Update,
 )
-from yandex.cloud.access.access_pb2 import (
-    AccessBinding,
-    ListAccessBindingsRequest,
-    SetAccessBindingsRequest,
-    Subject,
-)
 from yandex.cloud.compute.v1.instance_pb2 import Instance
-from yandex.cloud.compute.v1.instance_service_pb2 import (
-    GetInstanceRequest,
-    ListInstancesRequest,
-    RestartInstanceRequest,
-    StartInstanceRequest,
-    StopInstanceRequest,
-)
-from yandex.cloud.compute.v1.instance_service_pb2_grpc import InstanceServiceStub
 from yandex.cloud.mdb.postgresql.v1.cluster_pb2 import Cluster
-from yandex.cloud.mdb.postgresql.v1.cluster_service_pb2 import (
-    GetClusterRequest,
-    ListClustersRequest,
-    StartClusterRequest,
-    StopClusterRequest,
-)
-from yandex.cloud.mdb.postgresql.v1.cluster_service_pb2_grpc import ClusterServiceStub
-from yandex.cloud.serverless.functions.v1.function_pb2 import Function
-from yandex.cloud.serverless.functions.v1.function_service_pb2 import (
-    GetFunctionRequest,
-    ListFunctionsRequest,
-)
-from yandex.cloud.serverless.functions.v1.function_service_pb2_grpc import FunctionServiceStub
+
+import cloud_api
 
 # TODO:
-#   отлов ошибок
-#     grpc
-#     хендлеры
-#     sentry
+#   improve errors handling (sentry?)
 #   git
 #     auto deploy
-#   логирование
-#   описание команд
-#   команды
-#     установка хука
-#     установка команд
-#     выключение хука и функции
-#   управление функциями
-#     вкл/выкл доступ
-#   управление виртуалками
-#     сделать ip статическим / динамическим
-#   управление группами вм
-#     вкл / выкл
-#     параметры масштабирования
-#   контроль доступа
-#     юзер
-#     верификация запрашивающего
-#   добавить poll режим
-#   рестуктурировать файлы
-#     размотать лапшу в хендлере
-#     регистрация команды декоратором
+#   logging
+#   per-command help
+#   separate startup scenarios
+#     set / remove hook
+#     setup commands
+#   improve vm management
+#     make ip static / dynamic
+#   add instance group management
+#     on / off
+#   add access control
+#     online veryfi
+#   refactor
+#     decouple from a cloud specific
+#   env file support
 
-API_TOKEN = os.getenv('TOKEN')
+# todo: validate env
+
+
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CLOUD_TOKEN = os.getenv('CLOUD_TOKEN')
 FOLDER = os.getenv('FOLDER')
-bot = telebot.TeleBot(API_TOKEN)
+DEBUG_LIB = os.getenv('DEBUG_LIB')
+USERS_WHITELIST = os.getenv('TG_USERS_WHITELIST', '').split(';')
 
 INSTANCE_STATUS_EMOJI = {
-    Instance.PROVISIONING: '🔵',
-    Instance.RUNNING: '\U0001f7e2',
-    Instance.STOPPING: '🔴',
-    Instance.STOPPED: '🔴',
-    Instance.STARTING: '🔵',
-    Instance.RESTARTING: '🔵',
-    Instance.UPDATING: '🔵',
-    Instance.ERROR: '❗',
-    Instance.CRASHED: '❗️',
-    Instance.DELETING: '🗑',
+    Instance.PROVISIONING: emojize(':blue_circle:'),
+    Instance.RUNNING: emojize(':green_circle:'),
+    Instance.STOPPING: emojize(':red_circle:'),
+    Instance.STOPPED: emojize(':red_circle:'),
+    Instance.STARTING: emojize(':blue_circle:'),
+    Instance.RESTARTING: emojize(':blue_circle:'),
+    Instance.UPDATING: emojize(':blue_circle:'),
+    Instance.ERROR: emojize(':red_exclamation_mark:'),
+    Instance.CRASHED: emojize(':red_exclamation_mark:'),
+    Instance.DELETING: emojize(':wastebasket:'),
 }
 CLUSTER_STATUS_EMOJI = {
-    Cluster.STATUS_UNKNOWN: '❔',
-    Cluster.CREATING: '🔵',
-    Cluster.RUNNING: '\U0001f7e2',
-    Cluster.ERROR: '❗',
-    Cluster.UPDATING: '🔵',
-    Cluster.STOPPING: '🔴',
-    Cluster.STOPPED: '🔴',
-    Cluster.STARTING: '🔵',
+    Cluster.STATUS_UNKNOWN: emojize(':white_question_mark:'),
+    Cluster.CREATING: emojize(':blue_circle:'),
+    Cluster.RUNNING: emojize(':green_circle:'),
+    Cluster.ERROR: emojize(':red_exclamation_mark:'),
+    Cluster.UPDATING: emojize(':blue_circle:'),
+    Cluster.STOPPING: emojize(':red_circle:'),
+    Cluster.STOPPED: emojize(':red_circle:'),
+    Cluster.STARTING: emojize(':blue_circle:'),
 }
 FUNCTION_STATUS_EMOJI = {
-    True: '\U0001f7e2',
-    False: '🔴',
+    True: emojize(':green_circle:'),
+    False: emojize(':red_circle:'),
 }
+
+HELP = '''
+Available commands:
+
+/start, /help - show this help.
+
+/vm - compute instances management
+`/vm [list]` - show instances with their status and public ip;
+`/vm [get] <id>` - show actions for specified instance;
+`/vm [start | stop | restart] <id>` - do specified action on instance.
+
+/pg - postgresql clusters management
+`/pg [list]` - show instances with theirs status;
+`/pg [get] <id>` - show actions for specified cluster;
+`/pg [start | stop] <id>` - do specified action on cluster.
+
+/func - serverless functions management
+`/func [list]` - show functions with their public access status (opened / closed);
+`/func [get] <id>` - show actions for specified function;
+`/func open <id>` - allow public access to invoke function;
+`/func close <id>` - disallow public access to invoke function.
+'''
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='markdown')
+sdk = yandexcloud.SDK(token=CLOUD_TOKEN)
+logger = logging.getLogger(__name__)
+
+if DEBUG_LIB:
+    logging.getLogger('TeleBot').setLevel(logging.DEBUG)
+
+command_regex = re.compile('/(?P<cmd>[^ ]+)(?P<args>.*)')
+
+
+class ReplyFunc(Protocol):
+    def __call__(
+        self,
+        text: str,
+        markup: Optional[InlineKeyboardMarkup] = None,
+        *,
+        edit: bool,
+    ) -> None:
+        ...
+
+
+class UsersWhiteList(telebot.custom_filters.SimpleCustomFilter):
+    key = 'whitelist'
+
+    def check(self, event: Union[Message, CallbackQuery]):
+        if event is CallbackQuery:
+            message = event.message
+        else:
+            message = event
+        sender = message.from_user.username
+        if sender not in USERS_WHITELIST:
+            logger.warning('rejected message from user `%s`: `%s`', sender, message.text)
+            return False
+        return True
+
+
+bot.add_custom_filter(UsersWhiteList())
+
+
+def _reply(
+        chat_id: int,
+        message_id: Optional[int],
+        text: str,
+        markup: Optional[InlineKeyboardMarkup] = None,
+        *,
+        edit: bool,
+) -> None:
+    if message_id and edit:
+        # throws error if content (text, keyboard) is not changed
+        bot.edit_message_text(text, chat_id, message_id)
+        if markup:
+            bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
 
 
 def handler(event: dict, _context):
     update = Update.de_json(event['body'])
-    print(update)
+    logger.debug('%r', update)
     bot.process_new_updates([update])
     return {
         'statusCode': 200,
     }
 
 
-@bot.message_handler(commands=['start', 'help'])
-def handle_help(message):
-    bot.send_message(message.chat.id, 'to be continued...')
+@bot.message_handler(whitelist=True, commands=['start', 'help'])
+def handle_help(message: Message):
+    bot.send_message(message.chat.id, HELP)
 
 
-@bot.message_handler(commands=['test'])
-def handle_test(message):
+@bot.message_handler(whitelist=True, commands=['test'])
+def handle_test(message: Message):
     mu = InlineKeyboardMarkup()
     mu.add(
         InlineKeyboardButton('button 1', callback_data='1:1'),
@@ -124,324 +186,232 @@ def handle_test(message):
     bot.send_message(message.chat.id, 'message', reply_markup=mu)
 
 
-@bot.message_handler(commands=['vms', 'vm'])
-def handle_vms(message):
-    sdk = yandexcloud.SDK()
-    compute = sdk.client(InstanceServiceStub)
-    resp = compute.List(ListInstancesRequest(folder_id=FOLDER))
-    mu = InlineKeyboardMarkup()
-    text = "выбери ВМ"
-    for vm in resp.instances:
+@bot.message_handler(whitelist=True, commands=['vm', 'pg', 'func'])
+def handle_commands(message: Message):
+    command, args = parse_command_args(message.text)
+    handlers = resource_handlers[command]
+
+    if not args:
+        action = 'list'
+    elif len(args) == 1 and args[0] not in handlers.keys():
+        action = 'get'
+    else:
+        action, *args = args
+        if action not in handlers.keys():
+            bot.send_message(message.chat.id, 'wrong action')
+            return
+
+    if action == 'list':
+        args = [FOLDER]
+
+    command_handler = handlers[action]
+    # todo: check args count
+    reply = partial(_reply, message.chat.id, None)
+    command_handler(reply, *args)
+
+
+@bot.callback_query_handler(whitelist=True, func=lambda call: True)
+def handle_callback_query(call: CallbackQuery):
+    resource, cmd, arg = call.data.split(':')
+    resource_handler = resource_handlers.get(resource, {}).get(cmd)
+    reply = cast(ReplyFunc, partial(_reply, call.message.chat.id, call.message.id))
+    if resource_handler:
+        resource_handler(reply, arg)
+    else:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.id)
+    bot.answer_callback_query(call.id)
+
+
+def parse_command_args(text: str) -> Tuple[str, List[str]]:
+    match = command_regex.match(text).groupdict()
+    cmd = match['cmd']
+    args = match.get('args', '').split()
+    return cmd, args
+
+
+def vm_list_handler(reply: ReplyFunc, folder_id: str) -> None:
+    instances, error = cloud_api.vm_list(folder_id)
+    if error:
+        reply(f'unable to get vm list\n\n{error}', edit=False)
+        return
+
+    markup = InlineKeyboardMarkup()
+    text = 'choose vm'
+    for vm in instances:
         status_name = Instance.Status.Name(vm.status)
         status_emoji = INSTANCE_STATUS_EMOJI[vm.status]
         text += f'\n{status_emoji} {vm.name} {status_name}'
-        if vm.status in (Instance.RUNNING, Instance.PROVISIONING, Instance.STARTING) \
-                and vm.network_interfaces:
-            net = vm.network_interfaces[0].primary_v4_address
-            if net.one_to_one_nat:
-                text += f' {net.one_to_one_nat.address}'
-        mu.add(
-            InlineKeyboardButton(vm.name, callback_data=f'vm:{vm.id}'),
+        if vm.status in (Instance.RUNNING, Instance.PROVISIONING, Instance.STARTING):
+            for net in vm.network_interfaces:
+                if net.primary_v4_address.one_to_one_nat:
+                    text += f' {net.primary_v4_address.one_to_one_nat.address}'
+        markup.add(
+            InlineKeyboardButton(vm.name, callback_data=f'vm:get:{vm.id}'),
         )
-    bot.send_message(message.chat.id, text, reply_markup=mu)
+    reply(text, markup, edit=False)
 
 
-@bot.message_handler(commands=['func'])
-def handle_funcs(message):
-    sdk = yandexcloud.SDK()
-    functions = sdk.client(FunctionServiceStub)
-    resp = functions.List(ListFunctionsRequest(folder_id=FOLDER))
-    mu = InlineKeyboardMarkup()
-    for func in resp.functions:
-        resp_b = functions.ListAccessBindings(ListAccessBindingsRequest(resource_id=func.id))
-        status_emoji = FUNCTION_STATUS_EMOJI[bool(resp_b.access_bindings)]
-        mu.add(
-            InlineKeyboardButton(f'{status_emoji} {func.name}', callback_data=f'func:{func.id}'),
-        )
-    bot.send_message(message.chat.id, 'выбери функцию', reply_markup=mu)
+def vm_get_handler(reply: ReplyFunc, vm_id: str) -> None:
+    vm, error = cloud_api.vm_get(vm_id)
+    if error:
+        reply(f'unable to get vm `{vm_id}`\n\n{error}', edit=True)
+        return
+
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton('▶ start', callback_data=f'vm:start:{vm_id}'),
+        InlineKeyboardButton('⏹ stop', callback_data=f'vm:stop:{vm_id}'),
+        InlineKeyboardButton('⏯ restart', callback_data=f'vm:restart:{vm_id}'),
+    ]])
+    reply(vm.name, markup, edit=True)
 
 
-@bot.message_handler(commands=['cluster'])
-def handle_dbs(message):
-    sdk = yandexcloud.SDK()
-    clusters = sdk.client(ClusterServiceStub)
-    resp = clusters.List(ListClustersRequest(folder_id=FOLDER))
-    mu = InlineKeyboardMarkup()
-    text = "выбери кластер"
-    for cluster in resp.clusters:
+def vm_start_handler(reply: ReplyFunc, vm_id: str) -> None:
+    error = cloud_api.vm_start(vm_id)
+    if error:
+        reply(f'unable to start vm `{vm_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'vm `{vm_id}` starting', edit=True)
+
+
+def vm_stop_handler(reply: ReplyFunc, vm_id: str) -> None:
+    error = cloud_api.vm_stop(vm_id)
+    if error:
+        reply(f'unable to stop vm `{vm_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'vm `{vm_id}` stopping', edit=True)
+
+
+def vm_restart_handler(reply: ReplyFunc, vm_id: str) -> None:
+    error = cloud_api.vm_restart(vm_id)
+    if error:
+        reply(f'unable to restart vm `{vm_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'vm `{vm_id}` restarting', edit=True)
+
+
+def pg_list_handler(reply: ReplyFunc, folder_id: str) -> None:
+    clusters, error = cloud_api.pg_list(folder_id)
+    if error:
+        reply(f'unable to get pg clusters list\n\n{error}', edit=False)
+        return
+
+    markup = InlineKeyboardMarkup()
+    text = 'choose pg cluster'
+    for cluster in clusters:
         status_name = Cluster.Status.Name(cluster.status)
         status_emoji = CLUSTER_STATUS_EMOJI[cluster.status]
         text += f'\n{status_emoji} {cluster.name} {status_name}'
-        # TODO: строка подключения
-        # получить список хостов, найти мастера
-        # получить список бд
-        mu.add(
-            InlineKeyboardButton(cluster.name, callback_data=f'cluster:{cluster.id}'),
+        # TODO: connection string
+        markup.add(
+            InlineKeyboardButton(cluster.name, callback_data=f'pg:get:{cluster.id}'),
         )
-    bot.send_message(message.chat.id, text, reply_markup=mu)
+    reply(text, markup, edit=False)
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    cmd, arg = call.data.split(':')
-    if cmd == 'vm':
-        vm, error = get_vm(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось получить ВМ {arg}\n\n{error}", call.message.chat.id,
-                                  call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            mu = InlineKeyboardMarkup()
-            mu.add(
-                InlineKeyboardButton('▶ start', callback_data=f'vm-start:{arg}'),
-                InlineKeyboardButton('⏹ stop', callback_data=f'vm-stop:{arg}'),
-                InlineKeyboardButton('⏯ restart', callback_data=f'vm-restart:{arg}'),
-            )
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(vm.name, call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                          reply_markup=mu)
-    elif cmd == 'vm-start':
-        error = start_vm(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось запустить ВМ {arg}\n\n{error}", call.message.chat.id,
-                                  call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"ВМ {arg} запускается", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'vm-stop':
-        error = stop_vm(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось остановить ВМ {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"ВМ {arg} останавливается", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'vm-restart':
-        error = restart_vm(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось перезапустить ВМ {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"ВМ {arg} перезапускается", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'cluster':
-        # получить хосты, найти мастера
-        # получить список бд
-        # кнопки старт / стоп
-        cluster, error = get_cluster(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось получить кластер {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            mu = InlineKeyboardMarkup()
-            mu.add(
-                InlineKeyboardButton('▶ start', callback_data=f'cluster-start:{arg}'),
-                InlineKeyboardButton('⏹ stop', callback_data=f'cluster-stop:{arg}'),
-            )
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(cluster.name, call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                          reply_markup=mu)
-    elif cmd == 'cluster-start':
-        error = start_cluster(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось запустить кластер {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"кластер {arg} запускается", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'cluster-stop':
-        error = stop_cluster(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось остановить кластер {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"кластер {arg} останавливается", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'func':
-        func, error = get_func(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось получить функцию {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            mu = InlineKeyboardMarkup()
-            mu.add(
-                InlineKeyboardButton('open access', callback_data=f'func-open:{arg}'),
-                InlineKeyboardButton('close access', callback_data=f'func-close:{arg}'),
-            )
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(func.name, call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                          reply_markup=mu)
-    elif cmd == 'func-open':
-        error = open_func(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось открыть функцию {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"функция {arg} открыта", call.message.chat.id,
-                                  call.message.message_id)
-    elif cmd == 'func-close':
-        error = close_func(arg)
-        if error:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"не удалось закрыть функцию {arg}\n\n{error}",
-                                  call.message.chat.id, call.message.message_id)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(f"функция {arg} закрыта", call.message.chat.id,
-                                  call.message.message_id)
+def pg_get_handler(reply: ReplyFunc, pg_id: str) -> None:
+    cluster, error = cloud_api.pg_get(pg_id)
+    if error:
+        reply(f'unable to get pg cluster `{pg_id}`\n\n{error}', edit=True)
     else:
-        bot.answer_callback_query(call.id, call.data)
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=None)
-        bot.send_message(call.message.chat.id, call.data)
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton('▶ start', callback_data=f'pg:start:{pg_id}'),
+            InlineKeyboardButton('⏹ stop', callback_data=f'pg:stop:{pg_id}'),
+        ]])
+        reply(cluster.name, markup, edit=True)
 
 
-def get_vm(vm_id: str) -> Tuple[Instance, Optional[str]]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(InstanceServiceStub)
-    try:
-        return client.Get(GetInstanceRequest(instance_id=vm_id)), None
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return None, e.details()
-        return None, json.dumps(e.args)
+def pg_start_handler(reply: ReplyFunc, pg_id: str) -> None:
+    error = cloud_api.pg_start(pg_id)
+    if error:
+        reply(f'unable to start pg cluster `{pg_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'pg cluster `{pg_id}` starting', edit=True)
 
 
-def start_vm(vm_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(InstanceServiceStub)
-    try:
-        client.Start(StartInstanceRequest(instance_id=vm_id))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+def pg_stop_handler(reply: ReplyFunc, pg_id: str) -> None:
+    error = cloud_api.pg_stop(pg_id)
+    if error:
+        reply(f'unable to stop pg cluster `{pg_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'pg cluster `{pg_id}` stopping', edit=True)
 
 
-def stop_vm(vm_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(InstanceServiceStub)
-    try:
-        client.Stop(StopInstanceRequest(instance_id=vm_id))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+def func_list_handler(reply: ReplyFunc, folder_id: str) -> None:
+    functions, error = cloud_api.func_list(folder_id)
+    if error:
+        reply(f'unable to get functions list\n\n{error}', edit=False)
+        return
+
+    markup = InlineKeyboardMarkup()
+    for func, is_opened in functions:
+        status_emoji = FUNCTION_STATUS_EMOJI[is_opened]
+        markup.add(
+            InlineKeyboardButton(
+                f'{status_emoji} {func.name}',
+                callback_data=f'func:get:{func.id}',
+            ),
+        )
+
+    reply('choose function', markup, edit=False)
 
 
-def restart_vm(vm_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(InstanceServiceStub)
-    try:
-        client.Restart(RestartInstanceRequest(instance_id=vm_id))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+def func_get_handler(reply: ReplyFunc, func_id: str) -> None:
+    func, error = cloud_api.func_get(func_id)
+    if error:
+        reply(f'unable to get func `{func_id}`\n\n{error}', edit=True)
+    else:
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton('open access', callback_data=f'func:open:{func_id}'),
+            InlineKeyboardButton('close access', callback_data=f'func:close:{func_id}'),
+        ]])
+        reply(func.name, markup, edit=True)
 
 
-def get_cluster(cluster_id: str) -> Tuple[Cluster, Optional[str]]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(ClusterServiceStub)
-    try:
-        return client.Get(GetClusterRequest(cluster_id=cluster_id)), None
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return None, e.details()
-        return None, json.dumps(e.args)
+def func_open_handler(reply: ReplyFunc, func_id: str) -> None:
+    error = cloud_api.func_open(func_id)
+    if error:
+        reply(f'unable to open func `{func_id}`\n\n{error}', edit=True)
+    else:
+        reply(f'func `{func_id}` opened', edit=True)
 
 
-def start_cluster(cluster_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(ClusterServiceStub)
-    try:
-        client.Start(StartClusterRequest(cluster_id=cluster_id))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+def func_close_handler(reply: ReplyFunc, func_id: str) -> None:
+    error = cloud_api.func_close(func_id)
+    if error:
+        reply(f'unable to close func `{func_id}\n\n{error}`', edit=True)
+    else:
+        reply(f'func `{func_id}` closed', edit=True)
 
 
-def stop_cluster(cluster_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(ClusterServiceStub)
-    try:
-        client.Stop(StopClusterRequest(cluster_id=cluster_id))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+resource_handlers = {
+    'vm': {
+        'list': vm_list_handler,
+        'get': vm_get_handler,
+        'start': vm_start_handler,
+        'stop': vm_stop_handler,
+        'restart': vm_restart_handler,
+    },
+    'pg': {
+        'list': pg_list_handler,
+        'get': pg_get_handler,
+        'start': pg_start_handler,
+        'stop': pg_stop_handler,
+    },
+    'func': {
+        'list': func_list_handler,
+        'get': func_get_handler,
+        'open': func_open_handler,
+        'close': func_close_handler,
+    },
+}
 
 
-def get_func(func_id: str) -> Tuple[Function, Optional[str]]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(FunctionServiceStub)
-    try:
-        return client.Get(GetFunctionRequest(function_id=func_id)), None
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return None, e.details()
-        return None, json.dumps(e.args)
-
-
-def open_func(func_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(FunctionServiceStub)
-    try:
-        client.SetAccessBindings(SetAccessBindingsRequest(
-            resource_id=func_id,
-            access_bindings=[
-                AccessBinding(
-                    role_id='serverless.functions.invoker',
-                    subject=Subject(
-                        id='allUsers',
-                        type='system',
-                    ),
-                ),
-            ],
-        ))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
-
-
-def close_func(func_id: str) -> Optional[str]:
-    sdk = yandexcloud.SDK()
-    client = sdk.client(FunctionServiceStub)
-    try:
-        client.SetAccessBindings(SetAccessBindingsRequest(
-            resource_id=func_id,
-            access_bindings=[],
-        ))
-    except grpc.RpcError as e:
-        if hasattr(e, 'details'):
-            return e.details()
-        return json.dumps(e.args)
+if __name__ == '__main__':
+    bot.set_my_commands([
+        BotCommand('help', 'show help'),
+        BotCommand('vm', 'manage compute instances'),
+        BotCommand('pg', 'manage pg clusters'),
+        BotCommand('func', 'manage serverless functions'),
+    ])
+    bot.remove_webhook()
+    bot.polling()

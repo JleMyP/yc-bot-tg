@@ -8,5 +8,5 @@ yc serverless function version create \
   --execution-timeout 3s \
   --source-path pack.zip \
   --service-account-id $SERVICE_ACC \
-  --environment TOKEN=$TOKEN
+  --environment TOKEN=$TOKEN \
   --environment FOLDER=$FOLDER
