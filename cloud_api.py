@@ -1,17 +1,12 @@
 import enum
-import inspect
-import json
+from functools import wraps
 from typing import (
-    Callable,
     List,
     Optional,
-    Tuple,
     TypeVar,
-    Union,
 )
 
 import grpc
-from typing_extensions import ParamSpec
 from yandex.cloud.access.access_pb2 import (
     AccessBinding,
     ListAccessBindingsRequest,
@@ -42,122 +37,232 @@ from yandex.cloud.serverless.functions.v1.function_service_pb2 import (
 )
 from yandex.cloud.serverless.functions.v1.function_service_pb2_grpc import FunctionServiceStub
 
-# todo: why this is not work in pycharm?
 T = TypeVar('T')  # noqa: VNE001
-P = ParamSpec('P')  # noqa: VNE001
 
 
-def call_grpc(func: Callable[P, T]) -> Union[Callable[P, Optional[str]],
-                                             Callable[P, Tuple[Optional[str], T]]]:
-    from main import sdk  # todo: shit
+class AppException(Exception):
+    def format(self) -> str:  # noqa: A003
+        if isinstance(self.__context__, grpc.Call):
+            err = self.__context__
+            return f'{err.code().name}: {err.details()}'
+        return str(self)
 
-    func_signature = inspect.signature(func)
-    func_return = func_signature.return_annotation
-    stub = func_signature.parameters['client'].annotation
 
-    if func_return is None or func_return is func_signature.empty:
-        def wrapped(*args: P.args, **kwargs: P.kwargs) -> Optional[str]:
-            client = sdk.client(stub)
+class BaseRepo:
+    def __init__(self, folder_id: str) -> None:
+        self._folder_id = folder_id
+
+    @classmethod
+    def _is_not_found(cls, error: grpc.RpcError):
+        return isinstance(error, grpc.Call) and error.code() in (grpc.StatusCode.INVALID_ARGUMENT,
+                                                                 grpc.StatusCode.NOT_FOUND)
+
+    @staticmethod
+    def call_grpc(method: T) -> T:
+        @wraps(method)
+        def wrapped(*args, **kwargs):
             try:
-                func(client, *args, **kwargs)
+                return method(*args, **kwargs)
             except grpc.RpcError as e:
-                if hasattr(e, 'details'):
-                    return e.details()
-                return json.dumps(e.args)
-    else:
-        def wrapped(*args: P.args, **kwargs: P.kwargs) -> Tuple[Optional[str], T]:
-            client = sdk.client(stub)
-            try:
-                return func(client, *args, **kwargs), None
-            except grpc.RpcError as e:
-                if hasattr(e, 'details'):
-                    return None, e.details()
-                return None, json.dumps(e.args)
-
-    return wrapped
+                raise AppException from e
+        return wrapped
 
 
-@call_grpc
-def vm_list(client: InstanceServiceStub, folder_id: str) -> List[YaInstance]:
-    resp = client.List(ListInstancesRequest(folder_id=folder_id))
-    return list(resp.instances)
+class InstanceStatus(enum.Enum):
+    RUNNING = 'running'
+    IN_PROGRESS = 'in-progress'
+    STOPPED = 'stopped'
+    ERROR = 'error'
 
 
-@call_grpc
-def vm_get(client: InstanceServiceStub, vm_id: str) -> YaInstance:
-    return client.Get(GetInstanceRequest(instance_id=vm_id))
+class Instance:
+    _STATUS_MAP = {
+        YaInstance.PROVISIONING: InstanceStatus.IN_PROGRESS,
+        YaInstance.RUNNING: InstanceStatus.RUNNING,
+        YaInstance.STOPPING: InstanceStatus.IN_PROGRESS,
+        YaInstance.STOPPED: InstanceStatus.STOPPED,
+        YaInstance.STARTING: InstanceStatus.IN_PROGRESS,
+        YaInstance.RESTARTING: InstanceStatus.IN_PROGRESS,
+        YaInstance.UPDATING: InstanceStatus.IN_PROGRESS,
+        YaInstance.ERROR: InstanceStatus.ERROR,
+        YaInstance.CRASHED: InstanceStatus.ERROR,
+        YaInstance.DELETING: InstanceStatus.IN_PROGRESS,
+    }
+
+    def __init__(self, ya_instance: YaInstance):
+        self._instance = ya_instance
+        self.id: str = ya_instance.id
+        self.name: str = ya_instance.name
+        self.status = self._STATUS_MAP[ya_instance.status]
+        self.public_ips: List[str] = []
+
+        for net in ya_instance.network_interfaces:
+            if net.primary_v4_address.one_to_one_nat:
+                self.public_ips.append(net.primary_v4_address.one_to_one_nat.address)
 
 
-@call_grpc
-def vm_start(client: InstanceServiceStub, vm_id: str) -> None:
-    client.Start(StartInstanceRequest(instance_id=vm_id))
+class InstanceRepo(BaseRepo):
+    def __init__(self, folder_id: str, client: InstanceServiceStub) -> None:
+        super().__init__(folder_id)
+        self._client = client
+
+    @BaseRepo.call_grpc
+    def get_list(self, filter_: Optional[str] = None) -> List[Instance]:
+        resp = self._client.List(ListInstancesRequest(folder_id=self._folder_id, filter=filter_))
+        return [Instance(ya_instance) for ya_instance in resp.instances]
+
+    @BaseRepo.call_grpc
+    def get_single(self, id_or_name: str) -> Instance:
+        try:
+            ya_instance = self._client.Get(GetInstanceRequest(instance_id=id_or_name))
+        except grpc.RpcError as err:
+            if not self._is_not_found(err):
+                raise
+            instances = self.get_list(filter_=f'name="{id_or_name}"')
+            if not instances:
+                raise AppException('instance not found')
+            return instances[0]
+        return Instance(ya_instance)
+
+    @BaseRepo.call_grpc
+    def start(self, id_: str) -> None:
+        self._client.Start(StartInstanceRequest(instance_id=id_))
+
+    @BaseRepo.call_grpc
+    def stop(self, id_: str) -> None:
+        self._client.Stop(StopInstanceRequest(instance_id=id_))
+
+    @BaseRepo.call_grpc
+    def restart(self, id_: str) -> None:
+        self._client.Restart(RestartInstanceRequest(instance_id=id_))
 
 
-@call_grpc
-def vm_stop(client: InstanceServiceStub, vm_id: str) -> None:
-    client.Stop(StopInstanceRequest(instance_id=vm_id))
+class PostgresClusterStatus(enum.Enum):
+    RUNNING = 'running'
+    IN_PROGRESS = 'in-progress'
+    STOPPED = 'stopped'
+    ERROR = 'error'
+    UNKNOWN = 'unknown'
 
 
-@call_grpc
-def vm_restart(client: InstanceServiceStub, vm_id: str) -> None:
-    client.Restart(RestartInstanceRequest(instance_id=vm_id))
+class PostgresCluster:
+    _STATUS_MAP = {
+        Cluster.STATUS_UNKNOWN: PostgresClusterStatus.UNKNOWN,
+        Cluster.CREATING: PostgresClusterStatus.IN_PROGRESS,
+        Cluster.STARTING: PostgresClusterStatus.IN_PROGRESS,
+        Cluster.RUNNING: PostgresClusterStatus.RUNNING,
+        Cluster.ERROR: PostgresClusterStatus.ERROR,
+        Cluster.UPDATING: PostgresClusterStatus.IN_PROGRESS,
+        Cluster.STOPPING: PostgresClusterStatus.IN_PROGRESS,
+        Cluster.STOPPED: PostgresClusterStatus.STOPPED,
+    }
+
+    def __init__(self, pg: Cluster):
+        self._pg = pg
+        self.id: str = pg.id
+        self.name: str = pg.name
+        self.status = self._STATUS_MAP[pg.status]
 
 
-@call_grpc
-def pg_list(client: ClusterServiceStub, folder_id: str) -> List[Cluster]:
-    resp = client.List(ListClustersRequest(folder_id=folder_id))
-    return list(resp.clusters)
+class PostgresRepo(BaseRepo):
+    def __init__(self, folder_id: str, client: ClusterServiceStub) -> None:
+        super().__init__(folder_id)
+        self._client = client
+
+    @BaseRepo.call_grpc
+    def get_list(self, filter_: Optional[str] = None) -> List[PostgresCluster]:
+        resp = self._client.List(ListClustersRequest(folder_id=self._folder_id, filter=filter_))
+        return [PostgresCluster(pg) for pg in resp.clusters]
+
+    @BaseRepo.call_grpc
+    def get_single(self, id_or_name: str) -> PostgresCluster:
+        try:
+            pg = self._client.Get(GetClusterRequest(cluster_id=id_or_name))
+        except grpc.RpcError as err:
+            if not self._is_not_found(err):
+                raise
+            pgs = self.get_list(filter=f'name="{id_or_name}"')
+            if not pgs:
+                raise AppException('pg cluster not found')
+            return pgs[0]
+        return PostgresCluster(pg)
+
+    @BaseRepo.call_grpc
+    def start(self, id_: str) -> None:
+        self._client.Start(StartClusterRequest(cluster_id=id_))
+
+    @BaseRepo.call_grpc
+    def stop(self, id_: str) -> None:
+        self._client.Stop(StopClusterRequest(cluster_id=id_))
 
 
-@call_grpc
-def pg_get(client: ClusterServiceStub, cluster_id: str) -> Cluster:
-    return client.Get(GetClusterRequest(cluster_id=cluster_id))
+class ServerlessFunctionStatus(enum.Enum):
+    OPENED = 'opened'
+    CLOSED = 'closed'
 
 
-@call_grpc
-def pg_start(client: ClusterServiceStub, cluster_id: str) -> None:
-    client.Start(StartClusterRequest(cluster_id=cluster_id))
+class ServerlessFunction:
+    def __init__(self, function: Function, is_opened: bool):
+        self._function = function
+        self.id: str = function.id
+        self.name: str = function.name
+        self.status = (ServerlessFunctionStatus.OPENED
+                       if is_opened else ServerlessFunctionStatus.CLOSED)
+        self.invoke_url = function.http_invoke_url
 
 
-@call_grpc
-def pg_stop(client: ClusterServiceStub, cluster_id: str) -> None:
-    client.Stop(StopClusterRequest(cluster_id=cluster_id))
+class ServerlessFunctionRepo(BaseRepo):
+    def __init__(self, folder_id: str, client: FunctionServiceStub) -> None:
+        super().__init__(folder_id)
+        self._client = client
 
+    def _get_bindings(self, function_id: str) -> List[AccessBinding]:
+        bindings_resp = self._client.ListAccessBindings(
+            ListAccessBindingsRequest(resource_id=function_id),
+        )
+        return list(bindings_resp.access_bindings)
 
-@call_grpc
-def func_list(client: FunctionServiceStub, folder_id: str) -> List[Tuple[Function, bool]]:
-    resp = client.List(ListFunctionsRequest(folder_id=folder_id))
-    funcs = []
-    for func in resp.functions:
-        bindings_resp = client.ListAccessBindings(ListAccessBindingsRequest(resource_id=func.id))
-        funcs.append((func, bool(bindings_resp.access_bindings)))
-    return funcs
+    @BaseRepo.call_grpc
+    def get_list(self, filter_: Optional[str] = None) -> List[ServerlessFunction]:
+        resp = self._client.List(ListFunctionsRequest(folder_id=self._folder_id, filter=filter_))
+        funcs = []
+        for func in resp.functions:
+            is_opened = bool(self._get_bindings(func.id))
+            funcs.append(ServerlessFunction(func, is_opened))
+        return funcs
 
+    @BaseRepo.call_grpc
+    def get_single(self, id_or_name: str) -> ServerlessFunction:
+        try:
+            func = self._client.Get(GetFunctionRequest(function_id=id_or_name))
+        except grpc.RpcError as err:
+            if not self._is_not_found(err):
+                raise
+            funcs = self.get_list(filter_=f'name="{id_or_name}"')
+            if not funcs:
+                raise AppException('function not found')
+            return funcs[0]
+        is_opened = bool(self._get_bindings(func.id))
+        return ServerlessFunction(func, is_opened)
 
-@call_grpc
-def func_get(client: FunctionServiceStub, func_id: str) -> Function:
-    return client.Get(GetFunctionRequest(function_id=func_id))
-
-
-@call_grpc
-def func_open(client: FunctionServiceStub, func_id: str) -> None:
-    client.SetAccessBindings(SetAccessBindingsRequest(
-        resource_id=func_id,
-        access_bindings=[
-            AccessBinding(
-                role_id='serverless.functions.invoker',
-                subject=Subject(
-                    id='allUsers',
-                    type='system',
+    @BaseRepo.call_grpc
+    def open(self, id_: str) -> None:  # noqa: A003
+        self._client.SetAccessBindings(SetAccessBindingsRequest(
+            resource_id=id_,
+            access_bindings=[
+                AccessBinding(
+                    role_id='serverless.functions.invoker',
+                    subject=Subject(
+                        id='allUsers',
+                        type='system',
+                    ),
                 ),
-            ),
-        ],
-    ))
+            ],
+        ))
 
-
-@call_grpc
-def func_close(client: FunctionServiceStub, func_id: str) -> None:
-    client.SetAccessBindings(SetAccessBindingsRequest(
-        resource_id=func_id,
-        access_bindings=[],
-    ))
+    @BaseRepo.call_grpc
+    def close(self, id_: str) -> None:
+        self._client.SetAccessBindings(SetAccessBindingsRequest(
+            resource_id=id_,
+            access_bindings=[],
+        ))

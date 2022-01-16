@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "yc-bot-tg"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = []
 
@@ -8,7 +8,6 @@ authors = []
 python = "^3.7"
 pytelegrambotapi = "^4.3.0"
 yandexcloud = "^0.125.0"
-typing-extensions = "^4.0.1"
 emoji = "^1.6.1"
 
 [tool.poetry.dev-dependencies]
