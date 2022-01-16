@@ -129,7 +129,7 @@ def process_command(reply: ReplyFunc, command_text: str, request_id: str) -> Non
     client_stub = inspect.signature(repo_class.__init__).parameters['client'].annotation
     client = sdk.client(client_stub)
     repo = repo_class(FOLDER, client)
-    command = command_class(args, request_id, reply, repo)
+    command = command_class(args, request_id, reply, repo=repo)
     command.run()
 
 
@@ -140,15 +140,15 @@ def parse_command_args(text: str) -> Tuple[str, List[str]]:
     return cmd, args
 
 
+bot.add_custom_filter(UsersWhiteList())
+bot.set_my_commands(
+    [
+        BotCommand('help', 'show help'),
+    ] + [
+        BotCommand(command.name, command.short_doc())
+        for command in commands.values()
+    ]
+)
+
 if __name__ == '__main__':
-    bot.add_custom_filter(UsersWhiteList())
-    bot.set_my_commands(
-        [
-            BotCommand('help', 'show help'),
-        ] + [
-            BotCommand(command.name, command.short_doc())
-            for command in commands.values()
-        ]
-    )
-    bot.remove_webhook()
     bot.polling()
